@@ -1,0 +1,15 @@
+.env
+.venv/
+conf/
+__pycache__/
+*.pyc
+token.txt
+*.log
+state/
+web/.vercel
+web/node_modules
+*.log.*
+# account data snapshots (generated)
+dashboard_data.json
+dashboard.html
+logs/

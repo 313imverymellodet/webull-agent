@@ -1,0 +1,3 @@
+dev-server.mjs
+node_modules
+.env*

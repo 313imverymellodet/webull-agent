@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Swing Live · Sign in</title>
+<style>
+  :root{--ground:#F5F5F7;--surface:#fff;--ink:#1D1D1F;--ink-2:#6E6E73;--hair:#E3E3E8;--accent:#0071E3;--bad:#D70015;
+    --font:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,"Segoe UI",Roboto,sans-serif}
+  @media (prefers-color-scheme:dark){:root{--ground:#000;--surface:#1C1C1E;--ink:#F5F5F7;--ink-2:#98989D;--hair:#2C2C2E;--accent:#0A84FF;--bad:#FF453A}}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--ground);color:var(--ink);font:15px/1.45 var(--font);-webkit-font-smoothing:antialiased}
+  form{width:min(360px,calc(100vw - 40px));background:var(--surface);border:1px solid var(--hair);border-radius:18px;padding:28px}
+  h1{font-size:22px;letter-spacing:-.02em;margin:0 0 4px}
+  p{color:var(--ink-2);margin:0 0 20px;font-size:14px}
+  label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+  input{width:100%;font:inherit;padding:11px 12px;border-radius:10px;border:1px solid var(--hair);background:var(--ground);color:var(--ink)}
+  input:focus{outline:2px solid var(--accent);outline-offset:1px}
+  button{margin-top:14px;width:100%;font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+  button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  button[disabled]{opacity:.6;cursor:default}
+  .err{color:var(--bad);font-size:13px;margin-top:10px;min-height:18px}
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>Swing Live</h1>
+  <p>Sign in to view your trading dashboard.</p>
+  <label for="pw">Password</label>
+  <input id="pw" type="password" autocomplete="current-password" required autofocus>
+  <button id="go" type="submit">Sign in</button>
+  <div class="err" id="err" role="alert"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('go'), err = document.getElementById('err');
+  btn.disabled = true; btn.textContent = 'Signing in…'; err.textContent = '';
+  try {
+    const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: document.getElementById('pw').value})});
+    if (r.ok) return location.replace('/');
+    err.textContent = r.status === 401 ? 'That password is incorrect.' : 'Sign-in is unavailable. Check the server settings.';
+  } catch { err.textContent = "Can't reach the server. Try again."; }
+  btn.disabled = false; btn.textContent = 'Sign in';
+});
+</script>
+</body>
+</html>

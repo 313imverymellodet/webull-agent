@@ -1,0 +1,10 @@
+{
+  "name": "swing-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Read-only dashboard for the EMA swing runner. The Mac pushes snapshots; Webull keys never leave it.",
+  "scripts": {
+    "dev:local": "node dev-server.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
