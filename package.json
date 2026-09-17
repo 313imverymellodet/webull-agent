@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Vercel entry for the hosted dashboard (served from web/public; API in web/api).",
+  "engines": { "node": ">=18" }
+}

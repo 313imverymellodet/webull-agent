@@ -1,0 +1,10 @@
+# Only the dashboard deploys; keep trading code and data out of the upload.
+*.py
+*.log
+*.log.*
+logs
+state
+.venv
+README.md
+web/dev-server.mjs
+web/setup-vercel.sh
