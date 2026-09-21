@@ -4,9 +4,9 @@
 //   2. Vercel Blob if BLOB_READ_WRITE_TOKEN is set
 //   3. in-memory (local dev only)
 //
-// Blob objects are readable by anyone who has their URL. The snapshot holds
-// account balances and positions, so it is ENCRYPTED (AES-256-GCM, key derived
-// from SESSION_SECRET) before it is written. A leaked URL yields ciphertext.
+// The snapshot holds account balances and positions. The Blob store is private,
+// and the payload is ALSO encrypted (AES-256-GCM, key derived from SESSION_SECRET)
+// so a leaked URL or a store flipped to public still yields only ciphertext.
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 const redisUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
@@ -61,7 +61,7 @@ async function redis(command) {
 async function blobPut(text) {
   const { put } = await import("@vercel/blob");
   await put(BLOB_PATH, text, {
-    access: "public",              // Blob has no private mode; contents are encrypted
+    access: "private",             // the store is private; public access is rejected
     addRandomSuffix: false,        // stable path so reads can find it
     allowOverwrite: true,
     contentType: "text/plain",
@@ -71,12 +71,13 @@ async function blobPut(text) {
 }
 
 async function blobGet() {
-  const { list } = await import("@vercel/blob");
-  const { blobs } = await list({ prefix: BLOB_PATH, limit: 1, token: blobToken });
-  if (!blobs.length) return null;
-  const res = await fetch(`${blobs[0].url}?t=${Date.now()}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Blob read failed: HTTP ${res.status}`);
-  return res.text();
+  const { get } = await import("@vercel/blob");
+  const found = await get(BLOB_PATH, {
+    access: "private",
+    useCache: false,               // read origin, not the CDN copy
+    token: blobToken,
+  });
+  return found ? await found.blob.text() : null;
 }
 
 // ---- api ----
