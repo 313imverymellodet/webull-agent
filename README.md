@@ -101,18 +101,41 @@ browser --password cookie--> /api/state <-- Redis
 
 One-time setup:
 ```bash
-cd web
-npx vercel login                                    # you
-./setup-vercel.sh                                   # link project, set INGEST_TOKEN + SESSION_SECRET
-npx vercel env add DASHBOARD_PASSWORD production    # you: choose a password
-# Vercel dashboard → Storage → Upstash Redis → Connect to project   (you)
-npx vercel --prod
+npx vercel login          # you
+./deploy/vercel-env.sh    # sets INGEST_TOKEN + SESSION_SECRET, prompts for the password, redeploys
+# Vercel → Storage → Upstash Redis → Connect to project   (you, one click)
 ```
-Then set `DASHBOARD_URL` in `.env` to the production URL and run alongside the runner:
+Then set `DASHBOARD_URL` in `.env` **on the VPS** (that is where the publisher runs) and start it:
 ```bash
-./.venv/bin/python publish_snapshot.py
+systemctl enable --now webull-publisher   # on the VPS
 ```
 Local end-to-end test without Vercel: `cd web && npm run dev:local` (set the three env vars).
+
+## Safety rules
+
+Lessons taken from a public 0DTE build log, verified against this code.
+
+| Rule | Why |
+|---|---|
+| **Quote freshness, fail closed** | Webull returns `quote_time` and (on options) `delay_minutes`. A poll can return in 250ms while the data behind it is hours old. Quotes older than `QUOTE_MAX_AGE_SEC` (60s), or with no timestamp at all, are refused — no price, no action. |
+| **Never auto-resend a write** | A transport failure (timeout) may still have reached the broker; resending duplicates the position. Transport failures are now flagged *ambiguous*, verified by `client_order_id` via `order_exists()`, and never re-sent. Broker *rejections* stay definitive. |
+| **One instance per strategy** | `singleton.py` takes an exclusive lock. Two runners on one account double every trade. |
+| **Refusals are logged** | Refused quotes and skipped setups are printed each cycle. An engine that silently does nothing is indistinguishable from a broken one. |
+
+### Break-even hurdle
+Payoff ratio sets the win rate a strategy must clear before any edge exists:
+
+| Strategy | Avg win | Avg loss | Needs | Measured |
+|---|---|---|---|---|
+| Miyagi as written | +0.59% | −1.41% | **70.5%** | 56% ✗ |
+| Miyagi, candle-3 stop + T2 | +1.55% | −0.63% | **28.9%** | 38% ✓ |
+| EMA (2R target / 1R stop) | — | — | **33.3%** | 32.6–38% (thin) |
+
+### Known structural gap
+Webull's API has **no OCO/OTO brackets**, so stops live in our process, not at the
+broker. If a runner dies, an open position has no stop. (A runner did die silently
+on 2026-09-15.) Mitigations: state persisted to disk, single-instance locks,
+systemd `Restart=on-failure` on the VPS.
 
 ## ORB strategy (retired 2026-09-16)
 

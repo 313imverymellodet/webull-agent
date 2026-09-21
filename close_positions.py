@@ -97,7 +97,16 @@ def close_one(b, p):
         res = b.place(order)
         print(f"  SELL {sym_occ} x{qty} @ {limit} (bid {bid}) attempt {attempt+1} ok={res.ok}"
               + ("" if res.ok else f" {res.detail}"), flush=True)
-        if not res.ok:
+        if res.ambiguous:
+            time.sleep(5)
+            exists = b.order_exists(coid)
+            if not exists:
+                print(f"  {sym_occ}: send failed and order is "
+                      + ("NOT at Webull" if exists is False else "unverifiable")
+                      + " — stopping. Reconcile by hand before retrying.", flush=True)
+                return False
+            print(f"  {sym_occ}: send failed but the order IS at Webull; monitoring it", flush=True)
+        elif not res.ok:
             return False
         deadline = time.time() + TIMEOUT
         st = b.order_state(coid)

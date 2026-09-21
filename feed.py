@@ -79,7 +79,8 @@ class YFinanceFeed:
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
     def pick_option_dte(self, symbol: str, right: str, target_dte: int = 35,
-                        moneyness: str = "ATM", spot: Optional[float] = None) -> OptionPick:
+                        moneyness: str = "ATM", spot: Optional[float] = None,
+                        min_dte: int = 7) -> OptionPick:
         """ATM/OTM1 contract whose expiry is closest to target_dte.
 
         Swing holds run days, so short-dated contracts bleed theta; 30-45 DTE
@@ -89,9 +90,9 @@ class YFinanceFeed:
         today = date.today()
         exps = [(e, abs((datetime.strptime(e, "%Y-%m-%d").date() - today).days - target_dte))
                 for e in tk.options
-                if (datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 7]
+                if (datetime.strptime(e, "%Y-%m-%d").date() - today).days >= min_dte]
         if not exps:
-            raise RuntimeError(f"no expiry >= 7 DTE for {symbol}")
+            raise RuntimeError(f"no expiry >= {min_dte} DTE for {symbol}")
         expiry = min(exps, key=lambda x: x[1])[0]
         if spot is None:
             spot = self.spot(symbol)

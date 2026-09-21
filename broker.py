@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -31,11 +32,32 @@ class GuardrailError(Exception):
     pass
 
 
+QUOTE_MAX_AGE_SEC = float(os.getenv("QUOTE_MAX_AGE_SEC", "60"))
+
+
+def quote_age(row: dict) -> Optional[float]:
+    """Seconds since the broker timestamped this quote, or None if it has none.
+
+    Webull returns quote_time/last_trade_time (ms) and, on options, delay_minutes.
+    A poll can return in 250ms while the data behind it is hours old -- that is
+    what this catches."""
+    for k in ("quote_time", "last_trade_time"):
+        v = row.get(k)
+        if v:
+            try:
+                age = time.time() - int(v) / 1000.0
+                return age + float(row.get("delay_minutes") or 0) * 60
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 @dataclass
 class OrderResult:
     ok: bool
     detail: dict
     client_order_id: Optional[str] = None
+    ambiguous: bool = False      # send failed in a way that may still have reached Webull
 
 
 class WebullOptionsBroker:
@@ -56,6 +78,7 @@ class WebullOptionsBroker:
         self.tc = TradeClient(api)
         self._api = api
         self._dc = None
+        self.quote_rejects = {}          # symbol -> why the last quote was refused
         if not self.account_id:
             self.account_id = self._first_account()
 
@@ -76,8 +99,11 @@ class WebullOptionsBroker:
         return self.tc.order_v2.get_order_open(account_id=self.account_id).json()
 
     # ---- live quotes (Webull snapshot; real-time even on paper keys) ----
-    def option_quote(self, occ_symbol: str) -> Optional[dict]:
-        """Real-time bid/ask/last for one OCC option symbol, or None if unavailable."""
+    def option_quote(self, occ_symbol: str, allow_stale: bool = False) -> Optional[dict]:
+        """Real-time bid/ask/greeks for one OCC option symbol.
+
+        Fails closed: a quote with no broker timestamp, or one older than
+        QUOTE_MAX_AGE_SEC, returns None rather than a price we might trade on."""
         try:
             if self._dc is None:
                 self._dc = DataClient(self._api)
@@ -86,13 +112,21 @@ class WebullOptionsBroker:
             r = rows[0] if isinstance(rows, list) and rows else None
             if not r:
                 return None
+            age = quote_age(r)
+            if not allow_stale and (age is None or age > QUOTE_MAX_AGE_SEC):
+                self.quote_rejects[occ_symbol] = ("no timestamp" if age is None
+                                                  else f"stale {age:.0f}s")
+                return None
             f = lambda k: float(r[k]) if r.get(k) not in (None, "") else 0.0
-            return {"bid": f("bid"), "ask": f("ask"), "last": f("price"), "delta": r.get("delta")}
+            return {"bid": f("bid"), "ask": f("ask"), "last": f("price"),
+                    "delta": r.get("delta"), "gamma": r.get("gamma"),
+                    "open_interest": r.get("open_interest"), "age_sec": age}
         except Exception:
             return None
 
-    def stock_quote(self, symbol: str) -> Optional[dict]:
-        """Real-time underlying quote (used for stop/target checks)."""
+    def stock_quote(self, symbol: str, allow_stale: bool = False) -> Optional[dict]:
+        """Real-time underlying quote used for stop/target checks. Fails closed on
+        a missing or stale broker timestamp."""
         try:
             if self._dc is None:
                 self._dc = DataClient(self._api)
@@ -100,8 +134,14 @@ class WebullOptionsBroker:
             r = rows[0] if isinstance(rows, list) and rows else None
             if not r:
                 return None
+            age = quote_age(r)
+            if not allow_stale and (age is None or age > QUOTE_MAX_AGE_SEC):
+                self.quote_rejects[symbol] = ("no timestamp" if age is None
+                                              else f"stale {age:.0f}s")
+                return None
             f = lambda k: float(r[k]) if r.get(k) not in (None, "") else 0.0
-            return {"price": f("price"), "bid": f("bid"), "ask": f("ask"), "volume": f("volume")}
+            return {"price": f("price"), "bid": f("bid"), "ask": f("ask"),
+                    "volume": f("volume"), "age_sec": age}
         except Exception:
             return None
 
@@ -164,7 +204,23 @@ class WebullOptionsBroker:
         detail = self._run(lambda: self.tc.order_v2.place_option(self.account_id, order))
         coid = order[0].get("client_order_id")
         ok = not detail.get("_error")
-        return OrderResult(ok=ok, detail=detail, client_order_id=coid)
+        return OrderResult(ok=ok, detail=detail, client_order_id=coid,
+                           ambiguous=bool(detail.get("_ambiguous")))
+
+    def order_exists(self, client_order_id: str) -> Optional[bool]:
+        """True/False if Webull has this order, None if we cannot tell.
+
+        Our client_order_id is generated locally, so after an ambiguous send this
+        answers definitively whether the order reached the broker."""
+        d = self._run(lambda: self.tc.order_v2.get_order_detail(self.account_id, client_order_id))
+        if d.get("_error"):
+            # Webull answers "Order not present" for an id it never saw: that is a
+            # definitive no, not an unknown.
+            msg = str(d.get("msg", "")).lower()
+            if not d.get("_ambiguous") and ("not present" in msg or "not found" in msg):
+                return False
+            return None
+        return bool(d.get("orders"))
 
     def cancel(self, client_order_id: str) -> dict:
         return self._run(lambda: self.tc.order_v2.cancel_option(self.account_id, client_order_id))
@@ -175,6 +231,10 @@ class WebullOptionsBroker:
             res = fn()
             return res.json() if hasattr(res, "json") else res
         except ServerException as e:
-            return {"_error": True, "code": getattr(e, "error_code", ""), "msg": str(e)}
+            # Webull answered and refused: definitive, nothing was submitted.
+            return {"_error": True, "_ambiguous": False,
+                    "code": getattr(e, "error_code", ""), "msg": str(e)}
         except ClientException as e:
-            return {"_error": True, "code": "CLIENT", "msg": str(e)}
+            # Transport failure (timeout, connection): the order MAY have landed.
+            # Never auto-resend on this -- a replayed order is a duplicate position.
+            return {"_error": True, "_ambiguous": True, "code": "CLIENT", "msg": str(e)}

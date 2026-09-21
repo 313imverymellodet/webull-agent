@@ -13,3 +13,4 @@ web/node_modules
 dashboard_data.json
 dashboard.html
 logs/
+node_modules/

@@ -60,6 +60,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
+    if not a.once:
+        from singleton import single_instance
+        single_instance("publisher")
     if not URL or not TOKEN:
         sys.exit("Set DASHBOARD_URL and DASHBOARD_INGEST_TOKEN in .env")
     while True:

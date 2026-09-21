@@ -121,6 +121,15 @@ def _clear_working(broker, occ_symbol):
             _wait_cancelled(broker, c.get("client_order_id"))
 
 
+def account_deployed(broker) -> float:
+    """Premium tied up in ALL open option positions on the account."""
+    try:
+        return sum(float(p.get("cost") or 0) for p in (broker.positions() or [])
+                   if p.get("instrument_type") == "OPTION")
+    except Exception:
+        return float("inf")          # can't verify capital -> treat as fully deployed
+
+
 def place_with_reprice(broker, pick, contracts, side="BUY"):
     """Marketable limit with cushion; cancel + re-price if it doesn't fill."""
     cushion = envf("ORB_LIMIT_CUSHION_PCT", "10") / 100
@@ -142,8 +151,23 @@ def place_with_reprice(broker, pick, contracts, side="BUY"):
         except Exception as e:
             emit(pick.underlying, "blocked", f"guardrail: {e}"); return None
         res = broker.place(order)
-        if not res.ok:
-            emit(pick.underlying, "blocked", f"order rejected: {str(res.detail)[:110]}"); return None
+        if res.ambiguous:
+            # Transport failure: the order may still have reached Webull. Resending
+            # would risk a duplicate position, so verify by client_order_id and
+            # never re-send blindly.
+            _time.sleep(5)
+            exists = broker.order_exists(coid)
+            if exists:
+                emit(pick.underlying, "warn", "send failed but the order IS at Webull; monitoring it")
+            else:
+                emit(pick.underlying, "ambiguous",
+                     f"{side} send failed and the order is "
+                     + ("NOT at Webull" if exists is False else "unverifiable")
+                     + " - standing down, no auto-resend. Reconcile by hand.")
+                return None
+        elif not res.ok:
+            emit(pick.underlying, "blocked", f"order rejected: {str(res.detail)[:110]}")
+            return None
         emit(pick.underlying, "placed", f"{side} {pick.contract_symbol} x{contracts} @ {limit}")
         deadline = _time.time() + timeout
         st = broker.order_state(coid)
@@ -172,19 +196,30 @@ class Runner:
         self.htf = HTF_RULE.get(self.tf, "W")
         self.positions = load_json(POS_FILE, [])
         self.snap = {}
+        self._bars_cache = {}
         self.broker = None
         if live:
             from broker import WebullOptionsBroker
             self.broker = WebullOptionsBroker()
 
     # ---------- data ----------
-    def bars(self, sym):
+    def bars(self, sym, fresh=False):
+        """History for signals. Cached between entry checks: refetching 2 years for
+        every symbol every minute is ~11k requests/day, which gets data-center IPs
+        blocked by Yahoo. Live prices come from Webull; history only needs to be
+        fresh for the entry check itself."""
         period = "2y" if self.tf == "1d" else "60d"
+        ttl = float(os.getenv("EMA_BARS_CACHE_SEC", "900"))
+        hit = self._bars_cache.get(sym)
+        if hit and not fresh and _time.time() - hit[0] < ttl:
+            return hit[1]
         try:
-            return self.feed.bars(sym, self.tf, period)
+            df = self.feed.bars(sym, self.tf, period)
         except Exception:
             _time.sleep(3)                      # transient Yahoo failures; retry once
-            return self.feed.bars(sym, self.tf, period)
+            df = self.feed.bars(sym, self.tf, period)
+        self._bars_cache[sym] = (_time.time(), df)
+        return df
 
     def price(self, sym, bars=None):
         q = self.broker.stock_quote(sym) if self.broker else None
@@ -234,7 +269,7 @@ class Runner:
         maxpos = envi("EMA_MAX_POSITIONS", "3")
         for sym in symbols():
             try:
-                b = self.bars(sym)
+                b = self.bars(sym, fresh=place)     # always fresh for a real entry check
                 if len(b) < 250:
                     self.snap[sym] = {"status": "no-data"}; continue
                 ind = indicators(b, self.cfg, self.htf)
@@ -270,9 +305,13 @@ class Runner:
                 emit(sym, "error", f"{type(e).__name__}: {str(e)[:100]} @ {where}")
 
     def capital(self):
-        """Trade as if the account holds EMA_ACCOUNT_SIZE, not Webull's paper $1M."""
+        """Trade as if the account holds EMA_ACCOUNT_SIZE, not Webull's paper $1M.
+
+        Deployed capital is counted ACCOUNT-WIDE from Webull positions, so every
+        strategy running against this account shares the same limit.
+        """
         size = envf("EMA_ACCOUNT_SIZE", "0")
-        deployed = sum(p["entry_premium"] * p["qty"] * 100 for p in self.positions)
+        deployed = account_deployed(self.broker) if self.broker else 0.0
         return size, deployed, (size - deployed if size else float("inf"))
 
     def enter(self, sig):
@@ -333,6 +372,9 @@ def main():
     ap = argparse.ArgumentParser(description="EMA swing options runner")
     ap.add_argument("--mode", choices=["scan", "once", "live"], default="scan")
     a = ap.parse_args()
+    if a.mode == "live":
+        from singleton import single_instance
+        single_instance("ema")
     r = Runner(live=a.mode != "scan")
     print(f"EMA runner | tf={r.tf} htf={r.htf} | symbols={symbols()} | "
           f"rr={r.cfg.rr} adx>={r.cfg.adx_min} | dte~{envi('EMA_TARGET_DTE','35')}")
@@ -348,6 +390,8 @@ def main():
     entry_t = parse_hm(env("EMA_ENTRY_WINDOW", "15:45"), time(15, 45))
     open_t, close_t = time(9, 30), time(16, 0)
     last_entry_day = None
+    if date.today().weekday() >= 5:
+        print(f"{date.today()} is a weekend, not a trading day. Exiting."); return
     print(f"Live. Entry check daily at {entry_t:%H:%M} ET; exits monitored every minute.", flush=True)
     while True:
         now = datetime.now(); clock = now.time()
@@ -360,7 +404,12 @@ def main():
             print(f"\\n[{clock:%H:%M:%S}] session closed.")
             r.save("closed"); return
         r.manage()                                  # stops/targets every minute
-        due = (r.tf != "1d") or (clock >= entry_t and last_entry_day != now.date())
+        # A fresh broker quote proves the market is actually open: on a holiday the
+        # timer still fires, but no quote is current.
+        market_live = any((r.broker.stock_quote(x) or {}).get("price") for x in symbols()[:2])
+        if clock >= entry_t and last_entry_day != now.date() and not market_live:
+            print(f"[{clock:%H:%M:%S}] entry check skipped: no live quotes (market closed today?)", flush=True)
+        due = market_live and ((r.tf != "1d") or (clock >= entry_t and last_entry_day != now.date()))
         if due:
             r.evaluate(place=True)
             ok = sum(1 for v in r.snap.values() if v.get("status") == "watching")
@@ -370,6 +419,10 @@ def main():
             if r.tf == "1d": last_entry_day = now.date()
         else:
             r.evaluate(place=False)                 # refresh dashboard only
+        rejects = getattr(r.broker, "quote_rejects", {})
+        if rejects:        # a silently-idle engine must not look like a healthy one
+            print(f"[{clock:%H:%M:%S}] quotes refused (stale/no timestamp): {rejects}", flush=True)
+            r.broker.quote_rejects = {}
         held = ", ".join(f"{p['symbol']} {p['side']}" for p in r.positions) or "flat"
         print(f"[{clock:%H:%M:%S}] {held} | {len(r.positions)}/{envi('EMA_MAX_POSITIONS','3')} positions", flush=True)
         r.save("entries" if due else "monitor")

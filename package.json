@@ -2,5 +2,10 @@
   "private": true,
   "type": "module",
   "description": "Vercel entry for the hosted dashboard (served from web/public; API in web/api).",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.0"
+  }
 }
