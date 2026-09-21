@@ -11,7 +11,10 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:
 
 const redisUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const redisToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+// Vercel exposes the Blob token as BLOB_READ_WRITE_TOKEN, or <PREFIX>_READ_WRITE_TOKEN
+// when the store is connected with a custom prefix. Accept either.
+const blobToken = process.env.BLOB_READ_WRITE_TOKEN
+  || Object.entries(process.env).find(([k]) => /READ_WRITE_TOKEN$/.test(k))?.[1];
 const KEY = "swing:snapshot";
 const BLOB_PATH = "snapshot.enc";
 const memory = new Map();

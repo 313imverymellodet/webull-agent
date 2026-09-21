@@ -17,7 +17,7 @@ export default async function handler(req, res) {
     // env var NAMES the function can see (never values) to tell "not connected"
     // apart from "connected but not redeployed" or a non-default prefix.
     const seen = Object.keys(process.env).filter((k) =>
-      /^(BLOB|KV|UPSTASH|REDIS)/.test(k) || /BLOB_READ_WRITE_TOKEN$/.test(k));
+      /^(BLOB|KV|UPSTASH|REDIS)/.test(k) || /(READ_WRITE_TOKEN|REST_API_URL)$/.test(k));
     return send(res, err.status || 400, { error: err.message, storage_env_seen: seen });
   }
 }
