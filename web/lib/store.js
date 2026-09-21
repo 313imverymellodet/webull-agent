@@ -77,7 +77,9 @@ async function blobGet() {
     useCache: false,               // read origin, not the CDN copy
     token: blobToken,
   });
-  return found ? await found.blob.text() : null;
+  // get() returns metadata in `blob` and the CONTENT in `stream`.
+  if (!found || found.statusCode !== 200 || !found.stream) return null;
+  return await new Response(found.stream).text();
 }
 
 // ---- api ----
