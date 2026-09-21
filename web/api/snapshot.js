@@ -13,6 +13,11 @@ export default async function handler(req, res) {
     await saveSnapshot(snapshot);
     return send(res, 200, { ok: true });
   } catch (err) {
-    return send(res, err.status || 400, { error: err.message });
+    // Storage misconfiguration is the common failure here; report which storage
+    // env var NAMES the function can see (never values) to tell "not connected"
+    // apart from "connected but not redeployed" or a non-default prefix.
+    const seen = Object.keys(process.env).filter((k) =>
+      /^(BLOB|KV|UPSTASH|REDIS)/.test(k) || /BLOB_READ_WRITE_TOKEN$/.test(k));
+    return send(res, err.status || 400, { error: err.message, storage_env_seen: seen });
   }
 }
