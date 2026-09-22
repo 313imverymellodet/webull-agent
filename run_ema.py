@@ -20,6 +20,7 @@ import logging
 import os
 import time as _time
 import traceback
+from math import erf, exp, log, sqrt
 from datetime import date, datetime, time
 
 from dotenv import load_dotenv
@@ -121,6 +122,31 @@ def _clear_working(broker, occ_symbol):
             _wait_cancelled(broker, c.get("client_order_id"))
 
 
+def _ncdf(x): return 0.5 * (1 + erf(x / sqrt(2)))
+
+
+def bs_delta(S, K, T, vol, call, r=0.04):
+    if T <= 0 or vol <= 0 or K <= 0:
+        return 1.0 if call else -1.0
+    d1 = (log(S / K) + (r + vol * vol / 2) * T) / (vol * sqrt(T))
+    return _ncdf(d1) if call else -_ncdf(-d1)
+
+
+def strike_for_delta(S, T, vol, call, target):
+    """Strike whose delta is closest to target. 0.65D keeps ~all of the move a
+    0.50D captures while losing ~7 points less when wrong (measured on 113
+    historical signals); cheap OTM strikes were far worse."""
+    best, bd = S, 9.0
+    step = max(S * 0.0025, 0.5)
+    k = S * 0.80
+    while k <= S * 1.20:
+        d = abs(bs_delta(S, k, T, vol, call))
+        if abs(d - target) < bd:
+            bd, best = abs(d - target), k
+        k += step
+    return best
+
+
 def account_deployed(broker) -> float:
     """Premium tied up in ALL open option positions on the account."""
     try:
@@ -197,6 +223,7 @@ class Runner:
         self.positions = load_json(POS_FILE, [])
         self.snap = {}
         self._bars_cache = {}
+        self._ctx = {}
         self.broker = None
         if live:
             from broker import WebullOptionsBroker
@@ -283,6 +310,13 @@ class Runner:
                     "htf_bull": bool(row.htf_bull), "htf_bear": bool(row.htf_bear),
                     "held": sym in held, "bar": str(ind.index[-1]),
                 }
+                tr = pd.concat([b.High - b.Low, (b.High - b.Close.shift()).abs(),
+                                (b.Low - b.Close.shift()).abs()], axis=1).max(axis=1)
+                atr14 = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+                mov = abs(float(b.Close.iloc[-1]) - float(b.Close.iloc[-11]))
+                path = float(b.Close.diff().abs().iloc[-10:].sum())
+                self._ctx[sym] = {"atr": atr14, "atr_pct": atr14 / float(b.Close.iloc[-1]) * 100,
+                                  "er": (mov / path) if path else None}
                 sig = signal_at(sym, b, self.cfg, self.htf, -1)
                 if not sig:
                     continue
@@ -315,18 +349,63 @@ class Runner:
         return size, deployed, (size - deployed if size else float("inf"))
 
     def enter(self, sig):
-        pick = self.feed.pick_option_dte(sig.symbol, sig.side, envi("EMA_TARGET_DTE", "35"),
+        right = sig.side
+        ctx = self._ctx.get(sig.symbol, {})
+        pick = self.feed.pick_option_dte(sig.symbol, right, envi("EMA_TARGET_DTE", "35"),
                                          env("EMA_MONEYNESS", "ATM"), spot=sig.entry)
+
+        # Earnings blackout: a print inside the holding window can crush the
+        # option even when the stock moves our way.
+        if env("EMA_EARNINGS_BLACKOUT", "1") == "1":
+            ed = self.feed.next_earnings(sig.symbol)
+            exp_d = datetime.strptime(pick.expiry, "%Y-%m-%d").date()
+            if ed and date.today() <= ed <= exp_d:
+                emit(sig.symbol, "skipped", f"earnings {ed} falls before expiry {pick.expiry}")
+                return
+
         q = self.broker.option_quote(pick.contract_symbol) or {}
-        ask = q.get("ask") or pick.ask
+        ask, iv = q.get("ask") or pick.ask, float(q.get("iv") or 0)
         delta = abs(float(q.get("delta") or 0.5))
-        if not ask:
-            emit(sig.symbol, "blocked", "no option quote"); return
-        n, loss_per = size_contracts(delta, sig.risk, ask)
+
+        # Budget first: a deeper (higher-delta) contract costs more, and at a small
+        # account size the best strike is often unaffordable. Gather candidates
+        # from the target-delta strike out to ATM and take the highest-delta one
+        # that FITS, instead of refusing to trade.
         size, deployed, available = self.capital()
-        if size:
-            max_pos = size * envf("EMA_MAX_POSITION_PCT", "100") / 100
-            n = min(n, int(min(available, max_pos) // max(0.01, ask * 100)))
+        budget = min(available if size else float("inf"),
+                     size * envf("EMA_MAX_POSITION_PCT", "100") / 100 if size else float("inf"),
+                     envf("WEBULL_MAX_ORDER_VALUE", "0") or float("inf"))
+        target = envf("EMA_TARGET_DELTA", "0.65")
+        cands = {pick.strike: (pick.contract_symbol, ask, delta, iv)}
+        if iv > 0:
+            T = max(dte(pick.expiry), 1) / 365.0
+            want = strike_for_delta(sig.entry, T, iv, right == "CALL", target)
+            near = (self.feed.candidate_contracts(sig.symbol, right, pick.expiry, want, 3)
+                    + self.feed.candidate_contracts(sig.symbol, right, pick.expiry, sig.entry, 3))
+            for strike, occ in near:
+                if strike in cands:
+                    continue
+                cq = self.broker.option_quote(occ)
+                if cq and cq.get("ask"):
+                    cands[strike] = (occ, cq["ask"], abs(float(cq.get("delta") or 0)),
+                                     float(cq.get("iv") or iv))
+        fits = {k: v for k, v in cands.items() if v[1] * 100 <= budget}
+        if not fits:
+            cheapest = min(cands.values(), key=lambda v: v[1])
+            emit(sig.symbol, "skipped",
+                 f"cheapest contract ${cheapest[1]*100:.0f} exceeds the ${budget:.0f} available "
+                 f"(account ${size:.0f}, deployed ${deployed:.0f})")
+            return
+        # closest to target among those that fit == best quality we can afford
+        best_k = min(fits, key=lambda k: abs(fits[k][2] - target))
+        occ, ask, delta, iv = fits[best_k]
+        from feed import OptionPick
+        pick = OptionPick(sig.symbol, right, best_k, pick.expiry, 0, ask, 0, occ)
+        if abs(delta - target) > 0.08:
+            emit(sig.symbol, "note", f"budget forced delta {delta:.2f} (wanted {target:.2f})")
+
+        n, loss_per = size_contracts(delta, sig.risk, ask)
+        n = min(n, int(budget // max(0.01, ask * 100)))
         if n < 1:
             emit(sig.symbol, "skipped",
                  f"1 contract of {pick.contract_symbol} costs ${ask*100:.0f} and risks "
@@ -334,8 +413,20 @@ class Runner:
                  f"(account ${size:.0f}, available ${available:.0f}, "
                  f"order cap ${envf('WEBULL_MAX_ORDER_VALUE','0'):.0f})")
             return
-        emit(sig.symbol, "sizing", f"{pick.contract_symbol} {dte(pick.expiry)}DTE delta {delta:.2f} "
-                                   f"ask {ask} -> x{n} (~${loss_per*n:.0f} at stop)")
+
+        # Premium edge: expected travel vs what the option charges. Logged, NOT
+        # gated on -- it tested as noise with proxy IV (p=0.10). Revisit with
+        # real IV after enough live trades.
+        edge = None
+        if iv > 0 and ctx.get("atr"):
+            implied = sig.entry * iv * sqrt(max(dte(pick.expiry), 1) / 365.0)
+            travel = ctx["atr"] * 5 * max(ctx.get("er") or 0.05, 0.05)
+            edge = travel / implied if implied else None
+        emit(sig.symbol, "sizing",
+             f"{pick.contract_symbol} {dte(pick.expiry)}DTE delta {delta:.2f} "
+             f"(target {target:.2f}) IV {iv*100:.0f}% ask {ask} -> x{n} (~${loss_per*n:.0f} at stop)"
+             + (f" | edge {edge:.2f} ER {ctx.get('er') or 0:.2f}" if edge else ""))
+
         r = place_with_reprice(self.broker, pick, n, side="BUY")
         if not r:
             return
@@ -344,6 +435,7 @@ class Runner:
             "strike": pick.strike, "expiry": pick.expiry, "qty": r["qty"],
             "entry_premium": r["fill"], "entry_px": sig.entry, "stop": sig.stop,
             "target": sig.target, "risk": sig.risk, "risk_pct": sig.risk_pct, "delta": delta,
+            "iv": iv, "edge": edge, "er": ctx.get("er"), "atr_pct": ctx.get("atr_pct"),
             "opened_at": datetime.now().isoformat(timespec="seconds"), "coid": r["coid"],
         })
 

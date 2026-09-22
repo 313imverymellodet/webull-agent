@@ -112,6 +112,36 @@ class YFinanceFeed:
             last=float(row.get("lastPrice") or 0), contract_symbol=str(row["contractSymbol"]),
         )
 
+    def candidate_contracts(self, symbol: str, right: str, expiry: str,
+                            near: float, n: int = 6):
+        """OCC symbols for the n strikes nearest spot, nearest-first.
+
+        The runner prices these with Webull's real greeks and picks by delta;
+        yfinance chains carry no delta of their own."""
+        tk = yf.Ticker(symbol)
+        chain = tk.option_chain(expiry)
+        table = (chain.calls if right == "CALL" else chain.puts).copy()
+        table["dist"] = (table["strike"] - near).abs()
+        table = table.sort_values("dist").head(n)
+        return [(float(r.strike), str(r.contractSymbol)) for r in table.itertuples()]
+
+    def next_earnings(self, symbol: str) -> Optional[date]:
+        """Next scheduled earnings date, or None if unknown.
+
+        Buying 30-45 DTE premium into a print is a volatility-crush trap: the
+        move can go your way and the option still loses."""
+        try:
+            cal = yf.Ticker(symbol).calendar
+            dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            if not dates:
+                return None
+            nxt = [d if isinstance(d, date) else d.date() for d in
+                   (dates if isinstance(dates, list) else [dates])]
+            future = sorted(d for d in nxt if d >= date.today())
+            return future[0] if future else None
+        except Exception:
+            return None
+
     def _nearest_weekly_expiry(self, tk: yf.Ticker, skip_0dte: bool = True) -> str:
         today = date.today()
         for e in tk.options:

@@ -33,20 +33,24 @@ class GuardrailError(Exception):
 
 
 QUOTE_MAX_AGE_SEC = float(os.getenv("QUOTE_MAX_AGE_SEC", "60"))
+# Options on these keys carry delay_minutes=15 (no real-time options entitlement),
+# so a 60s ceiling would refuse every option quote and the runner would never
+# trade. Allow the known delay plus headroom; a dead feed is still caught.
+OPTION_MAX_AGE_SEC = float(os.getenv("QUOTE_MAX_AGE_SEC_OPTION", "1200"))
 
 
 def quote_age(row: dict) -> Optional[float]:
     """Seconds since the broker timestamped this quote, or None if it has none.
 
-    Webull returns quote_time/last_trade_time (ms) and, on options, delay_minutes.
     A poll can return in 250ms while the data behind it is hours old -- that is
-    what this catches."""
+    what this catches. The timestamp already reflects the feed's own delay
+    (options here are published on a 15-minute delay, in ~15-minute blocks), so
+    delay_minutes is reported separately rather than added again."""
     for k in ("quote_time", "last_trade_time"):
         v = row.get(k)
         if v:
             try:
-                age = time.time() - int(v) / 1000.0
-                return age + float(row.get("delay_minutes") or 0) * 60
+                return time.time() - int(v) / 1000.0
             except (TypeError, ValueError):
                 continue
     return None
@@ -113,14 +117,15 @@ class WebullOptionsBroker:
             if not r:
                 return None
             age = quote_age(r)
-            if not allow_stale and (age is None or age > QUOTE_MAX_AGE_SEC):
+            if not allow_stale and (age is None or age > OPTION_MAX_AGE_SEC):
                 self.quote_rejects[occ_symbol] = ("no timestamp" if age is None
                                                   else f"stale {age:.0f}s")
                 return None
             f = lambda k: float(r[k]) if r.get(k) not in (None, "") else 0.0
             return {"bid": f("bid"), "ask": f("ask"), "last": f("price"),
                     "delta": r.get("delta"), "gamma": r.get("gamma"),
-                    "open_interest": r.get("open_interest"), "age_sec": age}
+                    "open_interest": r.get("open_interest"), "iv": r.get("imp_vol"),
+                    "age_sec": age, "delay_min": float(r.get("delay_minutes") or 0)}
         except Exception:
             return None
 
