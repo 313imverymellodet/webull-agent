@@ -19,9 +19,14 @@ rsync -az --delete -e "$SSH" \
   ./ "$HOST:/opt/webull-agent/"
 
 echo "→ Checking the upload won't blank a setting the server has"
-blanked=$($SSH "$HOST" "cat /opt/webull-agent/.env 2>/dev/null" | awk -F= '/^[A-Z_]+=.+/{print $1}' | while read k; do
-  v=$(grep -E "^$k=" .env | cut -d= -f2- | sed 's/[[:space:]]*#.*//')
-  [ -z "$v" ] && echo "$k"; done)
+# (explicit if/fi + `|| true`: an `[ ] && echo` returns 1 for every non-blank
+#  value, which under `set -e` + pipefail aborted the whole deploy silently)
+server_keys=$($SSH "$HOST" "cat /opt/webull-agent/.env 2>/dev/null" | awk -F= '/^[A-Z_]+=.+/{print $1}' || true)
+blanked=""
+for k in $server_keys; do
+  v=$(grep -E "^$k=" .env 2>/dev/null | cut -d= -f2- | sed 's/[[:space:]]*#.*//' || true)
+  if [ -z "$v" ]; then blanked="$blanked $k"; fi
+done
 if [ -n "$blanked" ]; then
   echo "  REFUSING: local .env would blank server values: $blanked"
   echo "  Set them in the local .env (the source of truth), then re-run."
