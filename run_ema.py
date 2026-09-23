@@ -23,6 +23,7 @@ import traceback
 from math import erf, exp, log, sqrt
 from datetime import date, datetime, time
 
+import pandas as pd
 from dotenv import load_dotenv
 
 logging.getLogger("webull").setLevel(logging.CRITICAL)
@@ -301,7 +302,11 @@ class Runner:
                     self.snap[sym] = {"status": "no-data"}; continue
                 ind = indicators(b, self.cfg, self.htf)
                 row = ind.iloc[-1]
-                px, _ = self.price(sym, b)
+                # Live quote only when it matters (a real entry check, or a held
+                # position); the every-minute dashboard refresh uses the bar close.
+                # Quoting all 8 symbols every minute tripped Webull's rate limit.
+                px = (self.price(sym, b)[0] if (place or sym in held)
+                      else float(b.Close.iloc[-1]))
                 self.snap[sym] = {
                     "status": "watching", "price": px, "close": float(row.close),
                     "e1": float(row.e1), "e2": float(row.e2), "e3": float(row.e3),
@@ -474,6 +479,11 @@ def main():
         if r.broker: r.manage()
         r.evaluate(place=a.mode == "once")
         r.save("once")
+        errs = {k: v.get("error") for k, v in r.snap.items() if v.get("status") == "error"}
+        ok = sum(1 for v in r.snap.values() if v.get("status") == "watching")
+        print(f"evaluated {ok}/{len(symbols())} symbols" + (f" | ERRORS: {errs}" if errs else ""))
+        if errs:
+            raise SystemExit(1)
         print(json.dumps({"positions": r.positions,
                           "signals": {k: v.get("signal") for k, v in r.snap.items() if v.get("signal")}},
                          indent=1, default=str))
@@ -498,7 +508,11 @@ def main():
         r.manage()                                  # stops/targets every minute
         # A fresh broker quote proves the market is actually open: on a holiday the
         # timer still fires, but no quote is current.
-        market_live = any((r.broker.stock_quote(x) or {}).get("price") for x in symbols()[:2])
+        market_live = False
+        for x in symbols()[:4]:                     # a rate-limited reply is not "closed"
+            if (r.broker.stock_quote(x) or {}).get("price"):
+                market_live = True
+                break
         if clock >= entry_t and last_entry_day != now.date() and not market_live:
             print(f"[{clock:%H:%M:%S}] entry check skipped: no live quotes (market closed today?)", flush=True)
         due = market_live and ((r.tf != "1d") or (clock >= entry_t and last_entry_day != now.date()))

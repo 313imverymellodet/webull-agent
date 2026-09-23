@@ -83,6 +83,7 @@ class WebullOptionsBroker:
         self._api = api
         self._dc = None
         self.quote_rejects = {}          # symbol -> why the last quote was refused
+        self.rate_limited = 0            # count of TOO_MANY_REQUESTS back-offs
         if not self.account_id:
             self.account_id = self._first_account()
 
@@ -102,7 +103,23 @@ class WebullOptionsBroker:
     def open_orders(self):
         return self.tc.order_v2.get_order_open(account_id=self.account_id).json()
 
-    # ---- live quotes (Webull snapshot; real-time even on paper keys) ----
+    def _snapshot(self, fn):
+        """Call a market-data endpoint, backing off on Webull's rate limit.
+
+        TOO_MANY_REQUESTS used to surface as a missing quote, which the runner
+        reads as "market closed" or "no price" -- a silent wrong answer."""
+        delay = 1.0
+        for attempt in range(3):
+            try:
+                return fn()
+            except ServerException as e:
+                if "TOO_MANY_REQUESTS" not in str(getattr(e, "error_code", "")) + str(e) or attempt == 2:
+                    raise
+                self.rate_limited += 1
+                time.sleep(delay)
+                delay *= 2
+
+    # ---- live quotes (Webull snapshot; stocks real-time, options 15-min delayed) ----
     def option_quote(self, occ_symbol: str, allow_stale: bool = False) -> Optional[dict]:
         """Real-time bid/ask/greeks for one OCC option symbol.
 
@@ -111,8 +128,8 @@ class WebullOptionsBroker:
         try:
             if self._dc is None:
                 self._dc = DataClient(self._api)
-            rows = self._dc.option_market_data.get_option_snapshot(
-                occ_symbol, Category.US_OPTION.name).json()
+            rows = self._snapshot(lambda: self._dc.option_market_data.get_option_snapshot(
+                occ_symbol, Category.US_OPTION.name)).json()
             r = rows[0] if isinstance(rows, list) and rows else None
             if not r:
                 return None
@@ -135,7 +152,8 @@ class WebullOptionsBroker:
         try:
             if self._dc is None:
                 self._dc = DataClient(self._api)
-            rows = self._dc.market_data.get_snapshot(symbol, Category.US_STOCK.name).json()
+            rows = self._snapshot(lambda: self._dc.market_data.get_snapshot(
+                symbol, Category.US_STOCK.name)).json()
             r = rows[0] if isinstance(rows, list) and rows else None
             if not r:
                 return None
