@@ -47,5 +47,5 @@ $SSH "$HOST" 'cd /opt/webull-agent
   done; echo ok'
 
 echo "→ Smoke test ON THE SERVER (a deploy that can't evaluate symbols must fail here)"
-$SSH "$HOST" 'cd /opt/webull-agent && sudo -u trader .venv/bin/python tests/test_runner.py' \
+$SSH "$HOST" 'cd /opt/webull-agent && sudo -u trader .venv/bin/python tests/test_safety.py && sudo -u trader .venv/bin/python tests/test_runner.py' \
   || { echo "  SMOKE TEST FAILED -- the deployed code is broken. Fix before market open."; exit 1; }

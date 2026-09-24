@@ -56,6 +56,26 @@ def quote_age(row: dict) -> Optional[float]:
     return None
 
 
+def _is_rate_limited(e) -> bool:
+    return "TOO_MANY_REQUESTS" in str(getattr(e, "error_code", "")) + str(e)
+
+
+def with_backoff(fn, tries: int = 3, delay: float = 1.0):
+    """Retry on Webull's rate limit only.
+
+    A TOO_MANY_REQUESTS reply means the request was refused unprocessed, so a
+    retry is safe even for writes -- unlike a transport timeout, which is
+    ambiguous and must never be replayed."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except ServerException as e:
+            if not _is_rate_limited(e) or attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 @dataclass
 class OrderResult:
     ok: bool
@@ -95,29 +115,23 @@ class WebullOptionsBroker:
 
     # ---- reads ----
     def balance(self):
-        return self.tc.account_v2.get_account_balance(self.account_id).json()
+        return with_backoff(lambda: self.tc.account_v2.get_account_balance(self.account_id)).json()
 
     def positions(self):
-        return self.tc.account_v2.get_account_position(self.account_id).json()
+        return with_backoff(lambda: self.tc.account_v2.get_account_position(self.account_id)).json()
 
     def open_orders(self):
-        return self.tc.order_v2.get_order_open(account_id=self.account_id).json()
+        return with_backoff(lambda: self.tc.order_v2.get_order_open(account_id=self.account_id)).json()
 
     def _snapshot(self, fn):
-        """Call a market-data endpoint, backing off on Webull's rate limit.
-
-        TOO_MANY_REQUESTS used to surface as a missing quote, which the runner
-        reads as "market closed" or "no price" -- a silent wrong answer."""
-        delay = 1.0
-        for attempt in range(3):
-            try:
-                return fn()
-            except ServerException as e:
-                if "TOO_MANY_REQUESTS" not in str(getattr(e, "error_code", "")) + str(e) or attempt == 2:
-                    raise
+        """Market-data call with rate-limit backoff. A 429 used to surface as a
+        missing quote, which the runner read as "no price" or "market closed"."""
+        try:
+            return with_backoff(fn)
+        except ServerException as e:
+            if _is_rate_limited(e):
                 self.rate_limited += 1
-                time.sleep(delay)
-                delay *= 2
+            raise
 
     # ---- live quotes (Webull snapshot; stocks real-time, options 15-min delayed) ----
     def option_quote(self, occ_symbol: str, allow_stale: bool = False) -> Optional[dict]:
@@ -251,7 +265,9 @@ class WebullOptionsBroker:
     @staticmethod
     def _run(fn) -> dict:
         try:
-            res = fn()
+            # Backoff on 429s. Without it, a rate-limited order-status check read
+            # as UNKNOWN and the fill loop cancelled a still-working order.
+            res = with_backoff(fn)
             return res.json() if hasattr(res, "json") else res
         except ServerException as e:
             # Webull answered and refused: definitive, nothing was submitted.

@@ -148,13 +148,35 @@ def strike_for_delta(S, T, vol, call, target):
     return best
 
 
-def account_deployed(broker) -> float:
-    """Premium tied up in ALL open option positions on the account."""
+_DEPLOYED = {"t": 0.0, "v": None}
+
+
+def _invalidate_capital():
+    _DEPLOYED["t"] = 0.0
+
+
+class DeferredEntry(Exception):
+    """Entry can't be decided right now (e.g. positions unreadable); retry soon."""
+
+
+def account_deployed(broker, max_age: float = 20.0):
+    """Premium tied up in ALL open option positions, or None if unreadable.
+
+    Cached briefly: save() used to fetch positions four times per call, every
+    5s before the open -- the source of every rate-limit rejection (92/92 were
+    /positions/list). Returns None rather than infinity on failure: infinity
+    made the budget -inf, so a single rate-limited read silently skipped the
+    day's only entry check."""
+    now = _time.time()
+    if _DEPLOYED["v"] is not None and now - _DEPLOYED["t"] < max_age:
+        return _DEPLOYED["v"]
     try:
-        return sum(float(p.get("cost") or 0) for p in (broker.positions() or [])
-                   if p.get("instrument_type") == "OPTION")
+        v = sum(float(p.get("cost") or 0) for p in (broker.positions() or [])
+                if p.get("instrument_type") == "OPTION")
     except Exception:
-        return float("inf")          # can't verify capital -> treat as fully deployed
+        return None
+    _DEPLOYED.update(t=now, v=v)
+    return v
 
 
 def place_with_reprice(broker, pick, contracts, side="BUY"):
@@ -204,12 +226,16 @@ def place_with_reprice(broker, pick, contracts, side="BUY"):
             d = broker._run(lambda: broker.tc.order_v2.get_order_detail(broker.account_id, coid))
             fp = float((d.get("orders") or [{}])[0].get("filled_price") or limit)
             emit(pick.underlying, "filled", f"{side} filled x{st['filled']:.0f} @ {fp}")
+            _invalidate_capital()
             return {"coid": coid, "fill": fp, "qty": int(st["filled"])}
         _wait_cancelled(broker, coid)
         st = broker.order_state(coid)
         if st["filled"] > 0:
-            emit(pick.underlying, "filled", f"partial {st['filled']:.0f}/{st['total']:.0f}")
-            return {"coid": coid, "fill": limit, "qty": int(st["filled"])}
+            d = broker._run(lambda: broker.tc.order_v2.get_order_detail(broker.account_id, coid))
+            fp = float((d.get("orders") or [{}])[0].get("filled_price") or limit)
+            emit(pick.underlying, "filled", f"partial {st['filled']:.0f}/{st['total']:.0f} @ {fp}")
+            _invalidate_capital()
+            return {"coid": coid, "fill": fp, "qty": int(st["filled"])}
         emit(pick.underlying, "cancelled", f"no fill at {limit}; re-pricing")
     emit(pick.underlying, "not_filled", f"{side} not filled after {max_rp+1} tries")
     return None
@@ -225,6 +251,7 @@ class Runner:
         self.snap = {}
         self._bars_cache = {}
         self._ctx = {}
+        self._orphans = set()
         self.broker = None
         if live:
             from broker import WebullOptionsBroker
@@ -265,7 +292,7 @@ class Runner:
             if px is None:
                 keep.append(p); continue
             p["last_px"] = px
-            reason = exit_check(p["side"], px, p["stop"], p["target"])
+            reason = p.get("force_exit") or exit_check(p["side"], px, p["stop"], p["target"])
             if not reason and dte(p["expiry"]) <= envi("EMA_MIN_DTE_EXIT", "7"):
                 reason = "expiry"
             if not reason:
@@ -286,6 +313,50 @@ class Runner:
                 emit(p["symbol"], "warn", "exit order did not fill — still open, retrying next pass")
                 keep.append(p)
         self.positions = keep
+
+    def reconcile(self):
+        """Compare what we THINK we hold with what Webull says we hold.
+
+        Webull has no bracket orders, so a position the runner doesn't know about
+        has no stop protecting it, and one it wrongly thinks it holds gets sold
+        again. Conservative by design: a failed read changes nothing, and a
+        position is only dropped after it has been missing on 3 consecutive
+        checks and is more than 5 minutes old (fresh fills can lag)."""
+        try:
+            rows = self.broker.positions()
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        key = lambda sym, k, right, exp: (sym, round(float(k or 0), 2), right, exp)
+        held = set()
+        for q in rows:
+            if q.get("instrument_type") != "OPTION":
+                continue
+            leg = (q.get("legs") or [{}])[0]
+            held.add(key(q.get("symbol"), leg.get("option_exercise_price"),
+                          leg.get("option_type"), leg.get("option_expire_date")))
+        keep = []
+        for p in self.positions:
+            k = key(p["symbol"], p["strike"], p["side"], p["expiry"])
+            if k in held:
+                p.pop("missing", None); keep.append(p); continue
+            p["missing"] = p.get("missing", 0) + 1
+            age = (datetime.now() - datetime.fromisoformat(p["opened_at"])).total_seconds()
+            if p["missing"] >= 3 and age > 300:
+                emit(p["symbol"], "warn", f"{p['occ']} is no longer at Webull (closed outside the "
+                                          f"runner?) - no longer managing it")
+            else:
+                keep.append(p)
+        self.positions = keep
+        mine = {key(p["symbol"], p["strike"], p["side"], p["expiry"]) for p in self.positions}
+        others = {key(q["symbol"], q["strike"], q["side"], q["expiry"])
+                  for q in (load_json("state/miyagi_state.json", {}).get("positions") or [])}
+        for k in sorted(held - mine - others, key=str):
+            if k not in self._orphans:
+                self._orphans.add(k)
+                emit(k[0], "warn", f"UNMANAGED position at Webull: {k[0]} {k[1]} {k[2]} exp {k[3]} "
+                                   f"- no strategy owns it, so NO STOP is protecting it")
 
     def log_closed(self, p):
         hist = load_json("state/ema_closed.json", [])
@@ -326,16 +397,18 @@ class Runner:
                 if not sig:
                     continue
                 self.snap[sym]["signal"] = sig.side
-                # opposite-signal exit
-                for p in list(self.positions):
-                    if p["symbol"] == sym and p["side"] != sig.side and self.cfg.opp_exit:
-                        emit(sym, "exit", "opposite signal — closing")
-                        p["stop"] = p["target"] = sig.entry   # force exit_check next pass
+                if not place:
+                    # The daily bar is still forming: an intraday crossover can
+                    # vanish by the close. Act on signals only at the entry check.
+                    continue
+                for p in self.positions:
+                    if (p["symbol"] == sym and p["side"] != sig.side and self.cfg.opp_exit
+                            and not p.get("force_exit")):
+                        p["force_exit"] = f"opposite {sig.side} signal"
+                        emit(sym, "exit", f"opposite {sig.side} signal at the close; closing {p['side']}")
                 if sym in held or len(self.positions) >= maxpos:
                     continue
                 emit(sym, "signal", f"{sig.side} {sig.reason}")
-                if not place:
-                    continue
                 self.enter(sig)
             except Exception as e:
                 tb = traceback.extract_tb(e.__traceback__)[-1]
@@ -351,6 +424,8 @@ class Runner:
         """
         size = envf("EMA_ACCOUNT_SIZE", "0")
         deployed = account_deployed(self.broker) if self.broker else 0.0
+        if deployed is None:
+            return size, None, None
         return size, deployed, (size - deployed if size else float("inf"))
 
     def enter(self, sig):
@@ -377,6 +452,8 @@ class Runner:
         # from the target-delta strike out to ATM and take the highest-delta one
         # that FITS, instead of refusing to trade.
         size, deployed, available = self.capital()
+        if deployed is None:
+            raise DeferredEntry("broker positions unreadable; can't size safely")
         budget = min(available if size else float("inf"),
                      size * envf("EMA_MAX_POSITION_PCT", "100") / 100 if size else float("inf"),
                      envf("WEBULL_MAX_ORDER_VALUE", "0") or float("inf"))
@@ -446,6 +523,7 @@ class Runner:
 
     # ---------- state ----------
     def save(self, phase):
+        cap = self.capital()                   # ONE broker read per save (was four)
         save_json(POS_FILE, self.positions)
         save_json(SNAP_FILE, {
             "strategy": "ema", "timeframe": self.tf, "htf": self.htf,
@@ -458,10 +536,9 @@ class Runner:
                        "max_positions": envi("EMA_MAX_POSITIONS", "3"),
                        "entry_window": env("EMA_ENTRY_WINDOW", "15:45"),
                        "min_risk_pct": self.cfg.min_risk_pct,
-                       "account_size": self.capital()[0],
+                       "account_size": cap[0],
                        "max_position_pct": envf("EMA_MAX_POSITION_PCT", "100")},
-            "capital": {"size": self.capital()[0], "deployed": self.capital()[1],
-                        "available": self.capital()[2]},
+            "capital": {"size": cap[0], "deployed": cap[1], "available": cap[2]},
             "events": EVENTS})
 
 
@@ -495,16 +572,22 @@ def main():
     if date.today().weekday() >= 5:
         print(f"{date.today()} is a weekend, not a trading day. Exiting."); return
     print(f"Live. Entry check daily at {entry_t:%H:%M} ET; exits monitored every minute.", flush=True)
+    r.reconcile()
+    last_reconcile = _time.time()
     while True:
         now = datetime.now(); clock = now.time()
         if clock < open_t:
-            mins = (datetime.combine(now.date(), open_t) - now).total_seconds() / 60
-            print(f"[{clock:%H:%M:%S}] pre-market — {mins:.0f}m to open", end="\r", flush=True)
+            secs = (datetime.combine(now.date(), open_t) - now).total_seconds()
+            print(f"[{clock:%H:%M:%S}] pre-market — {secs/60:.0f}m to open", end="\r", flush=True)
             (r.evaluate(place=False) if not r.snap else None)
-            r.save("pre-market"); _time.sleep(min(60, max(5, mins * 6))); continue
+            # Wake AT the open. The old min(60, max(5, mins*6)) polled every 5s in
+            # the final minute, and each save hit Webull: 18 rejections at 09:29.
+            r.save("pre-market"); _time.sleep(max(1.0, min(60.0, secs))); continue
         if clock >= close_t:
             print(f"\\n[{clock:%H:%M:%S}] session closed.")
             r.save("closed"); return
+        if _time.time() - last_reconcile > 600:
+            r.reconcile(); last_reconcile = _time.time()
         r.manage()                                  # stops/targets every minute
         # A fresh broker quote proves the market is actually open: on a holiday the
         # timer still fires, but no quote is current.
@@ -520,9 +603,15 @@ def main():
             r.evaluate(place=True)
             ok = sum(1 for v in r.snap.values() if v.get("status") == "watching")
             sigs = [f"{k} {v['signal']}" for k, v in r.snap.items() if v.get("signal")]
+            errs = sorted(k for k, v in r.snap.items() if v.get("status") == "error")
             emit("*", "check", f"entry check: {ok}/{len(symbols())} symbols evaluated, "
-                               f"signals: {', '.join(sigs) or 'none'}")
-            if r.tf == "1d": last_entry_day = now.date()
+                               f"signals: {', '.join(sigs) or 'none'}"
+                               + (f" | ERRORS on {', '.join(errs)} - retrying next minute" if errs else ""))
+            # Only mark the day done when every symbol was actually evaluated. A
+            # transient failure (rate limit, data hiccup) used to forfeit the
+            # day's single entry check.
+            if r.tf == "1d" and not errs:
+                last_entry_day = now.date()
         else:
             r.evaluate(place=False)                 # refresh dashboard only
         rejects = getattr(r.broker, "quote_rejects", {})

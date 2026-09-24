@@ -163,6 +163,10 @@ class Miyagi:
             emit(sym, "blocked", f"no quote for {pick.contract_symbol}"); return
         size = R.envf("EMA_ACCOUNT_SIZE", "0")
         deployed = R.account_deployed(self.broker)
+        if deployed is None:
+            self.taken.discard(sym)          # retry on the next pass, don't forfeit the setup
+            emit(sym, "warn", "positions unreadable (rate limit?); retrying entry next pass")
+            return
         available = (size - deployed) if size else float("inf")
         budget = min(available, float(env("MIYAGI_MAX_POSITION_USD", "500")))
         n = min(int(budget // (ask * 100)), int(R.envf("WEBULL_MAX_ORDER_QTY", "5")))
