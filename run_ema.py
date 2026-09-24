@@ -33,7 +33,13 @@ load_dotenv()
 from feed import YFinanceFeed                      # noqa: E402
 from strategy_ema import EMAConfig, HTF_RULE, indicators, signal_at, exit_check  # noqa: E402
 
-STATE_DIR, POS_FILE, SNAP_FILE = "state", "state/ema_positions.json", "state/ema_state.json"
+# STATE_DIR is overridable so tests can never write to a live runner's files
+# (a deploy-gate test once overwrote production ema_state.json).
+STATE_DIR = os.getenv("STATE_DIR", "state")
+POS_FILE = os.path.join(STATE_DIR, "ema_positions.json")
+SNAP_FILE = os.path.join(STATE_DIR, "ema_state.json")
+CLOSED_FILE = os.path.join(STATE_DIR, "ema_closed.json")
+MIYAGI_FILE = os.path.join(STATE_DIR, "miyagi_state.json")
 EVENTS: list = []
 
 
@@ -351,7 +357,7 @@ class Runner:
         self.positions = keep
         mine = {key(p["symbol"], p["strike"], p["side"], p["expiry"]) for p in self.positions}
         others = {key(q["symbol"], q["strike"], q["side"], q["expiry"])
-                  for q in (load_json("state/miyagi_state.json", {}).get("positions") or [])}
+                  for q in (load_json(MIYAGI_FILE, {}).get("positions") or [])}
         for k in sorted(held - mine - others, key=str):
             if k not in self._orphans:
                 self._orphans.add(k)
@@ -359,8 +365,8 @@ class Runner:
                                    f"- no strategy owns it, so NO STOP is protecting it")
 
     def log_closed(self, p):
-        hist = load_json("state/ema_closed.json", [])
-        hist.append(p); save_json("state/ema_closed.json", hist)
+        hist = load_json(CLOSED_FILE, [])
+        hist.append(p); save_json(CLOSED_FILE, hist)
 
     # ---------- entries ----------
     def evaluate(self, place=True):

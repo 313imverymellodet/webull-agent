@@ -26,7 +26,7 @@ import run_ema as R                       # shared order/fill/state helpers + en
 from feed import YFinanceFeed
 from strategy_miyagi import find_setup, premarket_kind
 
-STATE = "state/miyagi_state.json"
+STATE = os.path.join(os.getenv("STATE_DIR", "state"), "miyagi_state.json")
 ET = "America/New_York"
 
 

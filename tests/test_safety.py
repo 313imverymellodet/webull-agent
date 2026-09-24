@@ -10,6 +10,10 @@ import numpy as np
 import pandas as pd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Never touch a live runner's state: these tests also run on the production
+# server as a deploy gate. Subprocesses inherit this too.
+import tempfile  # noqa: E402
+os.environ["STATE_DIR"] = tempfile.mkdtemp(prefix="webull-test-state-")
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 import run_ema as R                                   # noqa: E402
